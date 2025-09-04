@@ -5,22 +5,24 @@ edition = "2024"
 
 [dependencies]
 async-stream = "0.3.6"
-aws-config = { version = "1.8.5", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.103.0"
 axum = { version = "0.8.4", features = ["macros"] }
 blake2 = "0.10.6"
+chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.45", features = ["derive"] }
 color-eyre = "0.6.5"
 constant_time_eq = "0.4.2"
 futures-core = "0.3.31"
 hex = "0.4.3"
 nom = "8.0.0"
+positioned-io = "0.3.4"
+rc-zip-tokio = "4.2.7"
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls-native-roots"] }
+rocksdb = "0.24.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 sha2 = "0.10.9"
-time = { version = "0.3.41", features = ["formatting", "parsing", "serde"] }
-tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "fs"] }
+tokio-stream = "0.1.17"
 toml = "0.9.5"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

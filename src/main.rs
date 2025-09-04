@@ -1,24 +1,23 @@
 use std::{
     collections::HashMap,
-    convert::Infallible,
-    io::{Cursor, Read},
-    path::PathBuf,
+    io::{Cursor, ErrorKind},
+    path::{self, PathBuf},
+    sync::Arc,
 };
 
 use async_stream::stream;
-use aws_config::Region;
-use aws_sdk_s3::{
-    Client as S3Client,
-    config::{Credentials, SharedCredentialsProvider},
-    error::SdkError,
-    operation::get_object::GetObjectError,
-};
 use axum::{
-    body::{Body, Bytes}, extract::{DefaultBodyLimit, FromRequestParts, Path, State}, http::{request::Parts, HeaderMap, StatusCode}, response::{ErrorResponse, IntoResponse, Response}, routing::{get, options, post}, Json, RequestPartsExt, Router
+    Json, RequestPartsExt, Router,
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, FromRequestParts, Path, State},
+    http::{HeaderMap, StatusCode, request::Parts},
+    response::{ErrorResponse, IntoResponse, Response},
+    routing::{get, options, post},
 };
 use blake2::{Digest, digest::consts::U32};
+use chrono::{DateTime, Utc};
 use clap::Parser;
-use color_eyre::eyre::{self, Context, Result};
+use color_eyre::eyre::{Context, Result, eyre};
 use futures_core::Stream;
 use nom::{
     Parser as _,
@@ -27,8 +26,14 @@ use nom::{
     multi::many0,
     sequence::delimited,
 };
+use positioned_io::RandomAccessFile;
+use rc_zip_tokio::{ReadZip, rc_zip::parse::EntryKind};
+use rocksdb::{
+    BlockBasedOptions, Cache, CompactionPri, DB, DBCompressionType, FlushOptions, Options,
+};
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_stream::StreamExt;
 use tracing::{error, warn};
 use zerocopy::FromBytes;
 use zip::{ZipWriter, write::SimpleFileOptions};
@@ -39,17 +44,8 @@ const PREFETCH_SIZE: usize = 16;
 struct Config {
     base_url: String,
     bind_addr: String,
-    storage: StorageConfig,
+    storage_dir: PathBuf,
     forks: HashMap<String, ForkConfig>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct StorageConfig {
-    endpoint_url: Option<String>,
-    bucket: String,
-    region: String,
-    access_key_id: String,
-    secret_access_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -77,8 +73,8 @@ struct Args {
 #[derive(Clone)]
 struct AppState<'a> {
     base_url: &'a str,
-    bucket: &'a str,
-    s3_client: S3Client,
+    storage_dir: &'a path::Path,
+    db: &'a DB,
     forks: &'a HashMap<String, ForkConfig>,
     http_client: reqwest::Client,
 }
@@ -88,18 +84,30 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     let config: Config = toml::from_str(&tokio::fs::read_to_string(args.config_file).await?)?;
-    let sdk_config = aws_config::load_from_env().await;
-    let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
-    s3_config.set_endpoint_url(config.storage.endpoint_url);
-    s3_config.set_region(Some(Region::new(config.storage.region)));
-    s3_config.set_credentials_provider(Some(SharedCredentialsProvider::new(Credentials::new(
-        config.storage.access_key_id,
-        config.storage.secret_access_key,
-        None,
-        None,
-        "config",
-    ))));
-    let s3_client = S3Client::from_conf(s3_config.build());
+
+    let cache = Cache::new_lru_cache(128 << 20);
+    let mut table_opts = BlockBasedOptions::default();
+    table_opts.set_block_cache(&cache);
+    table_opts.set_bloom_filter(10., false);
+    table_opts.set_optimize_filters_for_memory(true);
+    table_opts.set_block_size(16 * 1024);
+    table_opts.set_cache_index_and_filter_blocks(true);
+    table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    table_opts.set_format_version(7);
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    opts.set_block_based_table_factory(&table_opts);
+    opts.set_compression_type(DBCompressionType::Zstd);
+    opts.set_compression_options(0, 3, 0, 16 << 10);
+    opts.set_zstd_max_train_bytes(1600 << 10);
+    opts.set_bottommost_compression_type(DBCompressionType::Zstd);
+    opts.set_bottommost_compression_options(0, 3, 0, 16 << 10, true);
+    opts.set_bottommost_zstd_max_train_bytes(1600 << 10, true);
+    opts.set_level_compaction_dynamic_level_bytes(true);
+    opts.set_max_background_jobs(6);
+    opts.set_bytes_per_sync(1048576);
+    opts.set_compaction_pri(CompactionPri::MinOverlappingRatio);
+    let db = DB::open(&opts, config.storage_dir.join("blobs"))?;
 
     let app = Router::new()
         .route("/fork/{fork}/manifest", get(fork_manifest))
@@ -125,8 +133,8 @@ async fn main() -> Result<()> {
         .layer(DefaultBodyLimit::max(512 << 20))
         .with_state(AppState {
             base_url: config.base_url.leak(),
-            bucket: config.storage.bucket.leak(),
-            s3_client,
+            storage_dir: Box::leak(Box::new(config.storage_dir)),
+            db: Box::leak(Box::new(db)),
             forks: Box::leak(Box::new(config.forks)),
             http_client: reqwest::Client::new(),
         });
@@ -151,45 +159,28 @@ async fn fork_publish_start(
         engine_version,
     }): Json<PublishStartRequest>,
 ) -> Result<(), ErrorResponse> {
-    let publish_inpr = state
-        .s3_client
-        .head_object()
-        .bucket(state.bucket)
-        .key(format!("pending/{fork}/{version}/started"))
-        .send()
-        .await
-        .is_ok();
-    if publish_inpr {
-        let mut files = state
-            .s3_client
-            .list_objects_v2()
-            .bucket(state.bucket)
-            .prefix(format!("pending/{fork}/{version}/"))
-            .into_paginator()
-            .send();
-        while let Some(page) = files.next().await {
-            let page = page.map_err(log_500)?;
-            for file in page.contents.ok_or(eyre::eyre!("Failed to list pending files")).map_err(log_500)? {
-                state
-                    .s3_client
-                    .delete_object()
-                    .bucket(state.bucket)
-                    .key(file.key.ok_or(eyre::eyre!("Failed to list pending files")).map_err(log_500)?)
-                    .send()
-                    .await
-                    .map_err(log_500)?;
-            }
+    if let Err(e) =
+        tokio::fs::remove_dir_all(state.storage_dir.join("pending").join(&fork).join(&version))
+            .await
+    {
+        if e.kind() != ErrorKind::NotFound {
+            return Err(log_500(e));
         }
     }
-    state
-        .s3_client
-        .put_object()
-        .bucket(state.bucket)
-        .key(format!("pending/{fork}/{version}/started"))
-        .body(engine_version.into_bytes().into())
-        .send()
+    tokio::fs::create_dir_all(state.storage_dir.join("pending").join(&fork).join(&version))
         .await
         .map_err(log_500)?;
+    tokio::fs::write(
+        state
+            .storage_dir
+            .join("pending")
+            .join(fork)
+            .join(version)
+            .join("started"),
+        engine_version,
+    )
+    .await
+    .map_err(log_500)?;
     Ok(())
 }
 
@@ -198,7 +189,7 @@ async fn fork_publish_file(
     Path(fork): Path<String>,
     State(state): State<AppState<'_>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<(), ErrorResponse> {
     let Some(file) = headers
         .get("Robust-Cdn-Publish-File")
@@ -212,26 +203,36 @@ async fn fork_publish_file(
     else {
         return Err((StatusCode::BAD_REQUEST).into());
     };
-    let publish_inpr = state
-        .s3_client
-        .head_object()
-        .bucket(state.bucket)
-        .key(format!("pending/{fork}/{version}/started"))
-        .send()
-        .await
-        .is_ok();
+    let publish_inpr = tokio::fs::try_exists(
+        state
+            .storage_dir
+            .join("pending")
+            .join(&fork)
+            .join(&version)
+            .join("started"),
+    )
+    .await
+    .map_err(log_500)?;
     if !publish_inpr {
         return Err((StatusCode::BAD_REQUEST).into());
     }
-    state
-        .s3_client
-        .put_object()
-        .bucket(state.bucket)
-        .key(format!("pending/{fork}/{version}/{file}"))
-        .body(body.into())
-        .send()
-        .await
-        .map_err(log_500)?;
+    let mut file = tokio::fs::File::create(
+        state
+            .storage_dir
+            .join("pending")
+            .join(fork)
+            .join(version)
+            .join(file),
+    )
+    .await
+    .map_err(log_500)?;
+    let mut body_stream = body.into_data_stream();
+    while let Some(chunk) = body_stream.next().await {
+        match chunk {
+            Ok(chunk) => file.write_all(&chunk).await.map_err(log_500)?,
+            Err(e) => return Err(log_500(e)),
+        }
+    }
     Ok(())
 }
 
@@ -247,8 +248,7 @@ struct ForkManifest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ForkVersionManifest {
-    #[serde(with = "time::serde::iso8601")]
-    time: OffsetDateTime,
+    time: DateTime<Utc>,
     client: ForkDownloadManifest,
     server: HashMap<String, ForkDownloadManifest>,
 }
@@ -262,145 +262,97 @@ struct ForkDownloadManifest {
 async fn fork_publish_finish(
     RequireAuthentication: RequireAuthentication,
     Path(fork): Path<String>,
-    State(state): State<AppState<'_>>,
+    State(state): State<AppState<'static>>,
     Json(PublishFinishRequest { version }): Json<PublishFinishRequest>,
 ) -> Result<(), ErrorResponse> {
-    let engine_version = state
-        .s3_client
-        .get_object()
-        .bucket(state.bucket)
-        .key(format!("pending/{fork}/{version}/started"))
-        .send()
-        .await;
+    let pending_dir = state.storage_dir.join("pending").join(&fork).join(&version);
+    let result_dir = state
+        .storage_dir
+        .join("versions")
+        .join(&fork)
+        .join(&version);
+    tokio::fs::create_dir_all(&result_dir)
+        .await
+        .map_err(log_500)?;
+    let engine_version = tokio::fs::read_to_string(pending_dir.join("started")).await;
     let engine_version = match engine_version {
         Ok(resp) => resp,
-        Err(SdkError::ServiceError(e)) if matches!(e.err(), &GetObjectError::NoSuchKey(_)) => {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
             return Err((StatusCode::BAD_REQUEST).into());
         }
         Err(e) => return Err(log_500(e)),
     };
-    let engine_version = engine_version
-        .body
-        .collect()
-        .await
-        .map_err(log_500)?
-        .into_bytes();
-    let engine_version =
-        str::from_utf8(&engine_version).map_err(log_500)?;
 
     let mut has_client = false;
     let mut server_platforms = vec![];
-    let mut all_files = vec![];
 
-    let prefix = format!("pending/{fork}/{version}/");
-    let mut files = state
-        .s3_client
-        .list_objects_v2()
-        .bucket(state.bucket)
-        .prefix(&prefix)
-        .into_paginator()
-        .send();
-    while let Some(page) = files.next().await {
-        let page = page.map_err(log_500)?;
-        for file in page.contents.ok_or(eyre::eyre!("Failed to list pending files")).map_err(log_500)? {
-            let key = file.key.ok_or(eyre::eyre!("Failed to list pending files")).map_err(log_500)?;
-            let filename = key
-                .strip_prefix(&prefix)
-                .ok_or(eyre::eyre!("Failed to list pending files")).map_err(log_500)?;
-            if let Some(artifact) = filename.strip_suffix(".zip") {
-                if let Some(platform) = artifact.strip_prefix("SS14.Server_") {
-                    server_platforms.push(platform.to_string());
-                } else if artifact == "SS14.Client" {
-                    has_client = true;
-                }
+    let mut files = tokio::fs::read_dir(&pending_dir).await.map_err(log_500)?;
+    while let Some(entry) = files.next_entry().await.map_err(log_500)? {
+        let filename = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| eyre!("File name is not UTF-8"))
+            .map_err(log_500)?;
+        if let Some(artifact) = filename.strip_suffix(".zip") {
+            if let Some(platform) = artifact.strip_prefix("SS14.Server_") {
+                server_platforms.push(platform.to_string());
+            } else if artifact == "SS14.Client" {
+                has_client = true;
             }
-            all_files.push(key);
         }
     }
     if !has_client {
-        for file in all_files {
-            state
-                .s3_client
-                .delete_object()
-                .bucket(state.bucket)
-                .key(file)
-                .send()
-                .await
-                .map_err(log_500)?;
-        }
+        tokio::fs::remove_dir_all(&pending_dir)
+            .await
+            .map_err(log_500)?;
         return Err((StatusCode::BAD_REQUEST).into());
     }
-    let client = state
-        .s3_client
-        .get_object()
-        .bucket(state.bucket)
-        .key(format!("pending/{fork}/{version}/SS14.Client.zip"))
-        .send()
+    let client =
+        Arc::new(RandomAccessFile::open(pending_dir.join("SS14.Client.zip")).map_err(log_500)?);
+    let client_zip = client
+        .read_zip()
         .await
-        .map_err(log_500)?
-        .body
-        .collect()
-        .await
-        .map_err(log_500)?
-        .into_bytes();
-    let mut client_zip =
-        zip::ZipArchive::new(Cursor::new(&client)).map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let mut client_manifest = "Robust Content Manifest 1\n".to_string();
-    for filename in client_zip
-        .file_names()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>()
-    {
-        let mut file = client_zip
-            .by_name(&filename)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        if file.is_dir() {
+    for file in client_zip.entries() {
+        if file.kind() != EntryKind::File {
             continue;
         }
-        let mut buf = Vec::with_capacity(file.size().min(64 << 20) as usize);
-        file.read_to_end(&mut buf)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        let buf = file.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
         let hash = blake2::Blake2b::<U32>::digest(&buf);
-        client_manifest += &format!("{} {}\n", hex::encode_upper(hash), filename);
-        let resp = state
-            .s3_client
-            .put_object()
-            .if_none_match("*")
-            .bucket(state.bucket)
-            .key(format!("content/{}", hex::encode(hash)))
-            .body(buf.into())
-            .send()
-            .await;
-        if let Err(e) = resp {
-            if let Some(e) = e.raw_response()
-                && e.status() == StatusCode::PRECONDITION_FAILED.into()
-            {
-                // 412 Precondition Failed is okay, we're deduping
-            } else {
-                return Err(log_500(e));
-            }
-        }
+        client_manifest += &format!("{} {}\n", hex::encode_upper(hash), file.name);
+        tokio::task::spawn_blocking(move || state.db.put(hash, buf))
+            .await
+            .map_err(log_500)?
+            .map_err(log_500)?;
     }
+    tokio::task::spawn_blocking(move || state.db.flush())
+        .await
+        .map_err(log_500)?
+        .map_err(log_500)?;
     let manifest_hash = blake2::Blake2b::<U32>::digest(client_manifest.as_bytes());
-    let client_zip_hash = sha2::Sha256::digest(&client);
-    state
-        .s3_client
-        .put_object()
-        .bucket(state.bucket)
-        .key(format!("versions/{fork}/{version}/manifest"))
-        .body(client_manifest.into_bytes().into())
-        .send()
+    let mut client = tokio::fs::File::open(pending_dir.join("SS14.Client.zip"))
         .await
         .map_err(log_500)?;
-    state
-        .s3_client
-        .put_object()
-        .bucket(state.bucket)
-        .key(format!("versions/{fork}/{version}/SS14.Client.zip"))
-        .body(client.into())
-        .send()
+    let mut client_zip_hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = client.read(&mut buf).await.map_err(log_500)?;
+        if read == 0 {
+            break;
+        }
+        client_zip_hasher.update(&buf[0..read]);
+    }
+    let client_zip_hash = client_zip_hasher.finalize();
+    tokio::fs::write(result_dir.join("manifest"), client_manifest)
         .await
         .map_err(log_500)?;
+    tokio::fs::rename(
+        pending_dir.join("SS14.Client.zip"),
+        result_dir.join("SS14.Client.zip"),
+    )
+    .await
+    .map_err(log_500)?;
     let build_json = serde_json::json!({
         "download": format!("{}/fork/{{FORK_ID}}/version/{{FORK_VERSION}}/file/SS14.Client.zip", state.base_url),
         "version": &version,
@@ -413,21 +365,9 @@ async fn fork_publish_finish(
     });
     let mut servers = HashMap::new();
     for platform in server_platforms {
-        let server = state
-            .s3_client
-            .get_object()
-            .bucket(state.bucket)
-            .key(format!(
-                "pending/{fork}/{version}/SS14.Server_{platform}.zip"
-            ))
-            .send()
+        let server = tokio::fs::read(pending_dir.join(format!("SS14.Server_{platform}.zip")))
             .await
-            .map_err(log_500)?
-            .body
-            .collect()
-            .await
-            .map_err(log_500)?
-            .to_vec();
+            .map_err(log_500)?;
         let mut server =
             ZipWriter::new_append(Cursor::new(server)).map_err(|_| StatusCode::BAD_REQUEST)?;
         server
@@ -448,55 +388,30 @@ async fn fork_publish_finish(
                 sha256: hex::encode_upper(sha2::Sha256::digest(&server)),
             },
         );
-        state
-            .s3_client
-            .put_object()
-            .bucket(state.bucket)
-            .key(format!(
-                "versions/{fork}/{version}/SS14.Server_{platform}.zip"
-            ))
-            .body(server.into())
-            .send()
-            .await
-            .map_err(log_500)?;
-    }
-    for file in all_files {
-        state
-            .s3_client
-            .delete_object()
-            .bucket(state.bucket)
-            .key(file)
-            .send()
-            .await
-            .map_err(log_500)?;
-    }
-
-    let manifest = state
-        .s3_client
-        .get_object()
-        .bucket(state.bucket)
-        .key(format!("manifests/{fork}"))
-        .send()
-        .await;
-    let mut manifest: ForkManifest = match manifest {
-        Ok(resp) => serde_json::from_slice(
-            &resp
-                .body
-                .collect()
-                .await
-                .map_err(log_500)?
-                .into_bytes(),
+        tokio::fs::write(
+            result_dir.join(format!("SS14.Server_{platform}.zip")),
+            server,
         )
-        .map_err(log_500)?,
-        Err(SdkError::ServiceError(e)) if matches!(e.err(), &GetObjectError::NoSuchKey(_)) => {
-            Default::default()
-        }
+        .await
+        .map_err(log_500)?;
+    }
+    tokio::fs::remove_dir_all(pending_dir)
+        .await
+        .map_err(log_500)?;
+
+    tokio::fs::create_dir_all(state.storage_dir.join("manifests"))
+        .await
+        .map_err(log_500)?;
+    let manifest = tokio::fs::read(state.storage_dir.join("manifests").join(&fork)).await;
+    let mut manifest: ForkManifest = match manifest {
+        Ok(manifest) => serde_json::from_slice(&manifest).map_err(log_500)?,
+        Err(e) if e.kind() == ErrorKind::NotFound => Default::default(),
         Err(e) => return Err(log_500(e)),
     };
     manifest.builds.insert(
         version.clone(),
         ForkVersionManifest {
-            time: OffsetDateTime::now_utc(),
+            time: Utc::now(),
             client: ForkDownloadManifest {
                 url: format!(
                     "{}/{fork}/version/{version}/file/SS14.Client.zip",
@@ -507,30 +422,24 @@ async fn fork_publish_finish(
             server: servers,
         },
     );
-    state
-        .s3_client
-        .put_object()
-        .bucket(state.bucket)
-        .key(format!("manifests/{fork}"))
-        .body(
-            serde_json::to_vec(&manifest)
-                .map_err(log_500)?
-                .into(),
-        )
-        .send()
-        .await
-        .map_err(log_500)?;
+    tokio::fs::write(
+        state.storage_dir.join("manifests").join(&fork),
+        serde_json::to_string(&manifest).map_err(log_500)?,
+    )
+    .await
+    .map_err(log_500)?;
     for watchdog in &state.forks[&fork].watchdogs {
         if let Err(e) = state
-                    .http_client
-                    .post(format!(
-                        "{}/instances/{}/update",
-                        watchdog.url, watchdog.instance
-                    ))
-                    .basic_auth(&watchdog.instance, Some(&watchdog.token))
-                    .send()
-                    .await
-                    .map(reqwest::Response::error_for_status) {
+            .http_client
+            .post(format!(
+                "{}/instances/{}/update",
+                watchdog.url, watchdog.instance
+            ))
+            .basic_auth(&watchdog.instance, Some(&watchdog.token))
+            .send()
+            .await
+            .map(reqwest::Response::error_for_status)
+        {
             warn!("Failed to notify watchdog: {e:?}");
         };
     }
@@ -540,81 +449,56 @@ async fn fork_publish_finish(
 async fn fork_manifest(
     Path(fork): Path<String>,
     State(state): State<AppState<'_>>,
-) -> Result<([(&'static str, &'static str); 1], Bytes), ErrorResponse> {
-    let resp = state
-        .s3_client
-        .get_object()
-        .bucket(state.bucket)
-        .key(format!("manifests/{fork}"))
-        .send()
-        .await;
-    let resp = match resp {
-        Ok(resp) => resp,
-        Err(SdkError::ServiceError(e)) if matches!(e.err(), &GetObjectError::NoSuchKey(_)) => {
-            return Err((StatusCode::NOT_FOUND).into());
-        }
+) -> Result<([(&'static str, &'static str); 1], Vec<u8>), ErrorResponse> {
+    let manifest = tokio::fs::read(state.storage_dir.join("manifests").join(&fork)).await;
+    let manifest = match manifest {
+        Ok(manifest) => manifest,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Err((StatusCode::NOT_FOUND).into()),
         Err(e) => return Err(log_500(e)),
     };
-
-    let body = resp
-        .body
-        .collect()
-        .await
-        .map_err(log_500)?;
-    Ok(([("Content-Type", "application/json")], body.into_bytes()))
+    Ok(([("Content-Type", "application/json")], manifest))
 }
 
 async fn version_manifest(
     Path((fork, version)): Path<(String, String)>,
     State(state): State<AppState<'_>>,
-) -> Result<([(&'static str, &'static str); 1], Bytes), ErrorResponse> {
-    let resp = state
-        .s3_client
-        .get_object()
-        .bucket(state.bucket)
-        .key(format!("versions/{fork}/{version}/manifest"))
-        .send()
-        .await;
-    let resp = match resp {
-        Ok(resp) => resp,
-        Err(SdkError::ServiceError(e)) if matches!(e.err(), &GetObjectError::NoSuchKey(_)) => {
-            return Err((StatusCode::NOT_FOUND).into());
-        }
+) -> Result<([(&'static str, &'static str); 1], Vec<u8>), ErrorResponse> {
+    let body = tokio::fs::read(
+        state
+            .storage_dir
+            .join("versions")
+            .join(&fork)
+            .join(&version)
+            .join("manifest"),
+    )
+    .await;
+    let body = match body {
+        Ok(body) => body,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Err((StatusCode::NOT_FOUND).into()),
         Err(e) => return Err(log_500(e)),
     };
-
-    let body = resp.body.collect().await.map_err(log_500)?;
-    Ok(([("Content-Type", "text/plain")], body.into_bytes()))
+    Ok(([("Content-Type", "text/plain")], body))
 }
 
 async fn version_file(
     Path((fork, version, file)): Path<(String, String, String)>,
     State(state): State<AppState<'_>>,
-) -> Result<([(&'static str, String); 1], Bytes), ErrorResponse> {
-    let resp = state
-        .s3_client
-        .get_object()
-        .bucket(state.bucket)
-        .key(format!("versions/{fork}/{version}/{file}"))
-        .send()
-        .await;
-    let resp = match resp {
-        Ok(resp) => resp,
-        Err(SdkError::ServiceError(e)) if matches!(e.err(), &GetObjectError::NoSuchKey(_)) => {
-            return Err((StatusCode::NOT_FOUND).into());
-        }
+) -> Result<Vec<u8>, ErrorResponse> {
+    let body = tokio::fs::read(
+        state
+            .storage_dir
+            .join("versions")
+            .join(&fork)
+            .join(&version)
+            .join(&file),
+    )
+    .await;
+    let body = match body {
+        Ok(body) => body,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Err((StatusCode::NOT_FOUND).into()),
         Err(e) => return Err(log_500(e)),
     };
-
-    let body = resp.body.collect().await.map_err(log_500)?;
-    Ok((
-        [(
-            "Content-Type",
-            resp.content_type
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-        )],
-        body.into_bytes(),
-    ))
+    Ok(body)
 }
 
 async fn download_options() -> [(&'static str, &'static str); 2] {
@@ -633,23 +517,22 @@ async fn download_post(
         return Err((StatusCode::BAD_REQUEST).into());
     };
 
-    let resp = state
-        .s3_client
-        .get_object()
-        .bucket(state.bucket)
-        .key(format!("versions/{fork}/{version}/manifest"))
-        .send()
-        .await;
+    let resp = tokio::fs::read(
+        state
+            .storage_dir
+            .join("versions")
+            .join(&fork)
+            .join(&version)
+            .join("manifest"),
+    )
+    .await;
     let resp = match resp {
         Ok(resp) => resp,
-        Err(SdkError::ServiceError(e)) if matches!(e.err(), &GetObjectError::NoSuchKey(_)) => {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
             return Err((StatusCode::NOT_FOUND).into());
         }
         Err(e) => return Err(log_500(e)),
     };
-
-    let resp = resp.body.collect().await.map_err(log_500)?;
-    let resp = resp.into_bytes();
 
     let manifest = str::from_utf8(&resp).map_err(log_500)?;
     let manifest = parse_manifest(manifest).map_err(log_500)?;
@@ -665,41 +548,20 @@ async fn download_post(
     Ok(Body::from_stream(get_blobs(state, blobs)))
 }
 
-fn get_blobs(
-    state: AppState<'static>,
-    blobs: Vec<[u8; 32]>,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let mut blobs = blobs.into_iter();
-    let mut next: usize = 0;
-    let mut prefetch = [const { None }; PREFETCH_SIZE];
-    for entry in prefetch.iter_mut() {
-        *entry = blobs
-            .next()
-            .map(|blob| tokio::spawn(get_blob(state.clone(), blob)));
-    }
+fn get_blobs(state: AppState<'static>, blobs: Vec<[u8; 32]>) -> impl Stream<Item = Result<Bytes>> {
     stream! {
+        let blobs = blobs.chunks(PREFETCH_SIZE);
         yield Ok(Bytes::from_static(&[0, 0, 0, 0]));
-        while let Some(fut) = std::mem::take(&mut prefetch[next]) {
-            let resp = fut.await.ok().flatten().unwrap_or_else(Bytes::new);
-            yield Ok(Bytes::from((resp.len() as u32).to_le_bytes().to_vec()));
-            yield Ok(resp);
-            prefetch[next] = blobs.next().map(|blob| tokio::spawn(get_blob(state.clone(), blob)));
-            next = (next + 1) % PREFETCH_SIZE;
+        for blobchunk in blobs {
+            let blobchunk = blobchunk.to_vec();
+            let resps = tokio::task::spawn_blocking(move || state.db.multi_get(blobchunk)).await?;
+            for resp in resps {
+                let resp = resp.unwrap_or_default().unwrap_or_default();
+                yield Ok(Bytes::from((resp.len() as u32).to_le_bytes().to_vec()));
+                yield Ok(Bytes::from(resp));
+            }
         }
     }
-}
-
-async fn get_blob(state: AppState<'_>, blob: [u8; 32]) -> Option<Bytes> {
-    let resp = state
-        .s3_client
-        .get_object()
-        .bucket(state.bucket)
-        .key(format!("content/{}", hex::encode(blob)))
-        .send()
-        .await
-        .ok()?;
-
-    Some(resp.body.collect().await.ok()?.into_bytes())
 }
 
 struct ContentManifest<'a>(Vec<ContentManifestEntry<'a>>);
